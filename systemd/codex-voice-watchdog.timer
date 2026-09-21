@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodically ensure the codex-voice window is running
+
+[Timer]
+OnBootSec=5s
+OnUnitActiveSec=20s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

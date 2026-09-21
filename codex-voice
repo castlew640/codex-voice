@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""Push-to-talk voice input for Codex CLI. Mic -> local Whisper -> Windows clipboard.
+
+Default mode (Claude-Code-style):
+  Type "voice" + Enter to arm, then press Space to start recording and
+  Space again to stop and send. Esc while recording cancels that utterance;
+  Esc while idle disarms back to the prompt. Ctrl+C quits.
+  Type /clear + Enter (armed or not) to wipe old transcripts; you stay armed.
+  The newest transcript is shown in bold green, older ones dimmed.
+
+  codex-voice --loop     Old hands-free mode: no keys at all, auto-detects
+                          speech via silence, sends automatically, repeats.
+
+Each utterance is transcribed and copied to the Windows clipboard -- switch
+to the Codex window and Ctrl+V to paste it in. (Earlier versions tried to
+push text straight into a session via `codex queue`, but that only delivers
+to a session when it's *resumed*, not to one you already have open and
+focused -- so nothing ever showed up. Clipboard + paste actually works.)
+"""
+import argparse
+import select
+import shutil
+import subprocess
+import sys
+import tempfile
+import termios
+import tty
+from pathlib import Path
+
+HOME = Path.home()
+VENV_PY = HOME / ".local/share/codex-voice/venv/bin/python"
+MODELS_DIR = HOME / ".local/share/codex-voice/models"
+CLIP_EXE = shutil.which("clip.exe") or "/mnt/c/Windows/System32/clip.exe"
+
+# Nudges Whisper toward the vocabulary this actually gets used for, so it's
+# less likely to mangle tool/CLI names into the nearest dictionary word.
+INITIAL_PROMPT = (
+    "Codex, Claude, WSL, git, npm, PowerShell, Python, bash, terminal, "
+    "clipboard, repo, commit, branch, pull request, PR, CLI, JSON, YAML."
+)
+
+if sys.executable != str(VENV_PY) and VENV_PY.exists():
+    import os
+    os.execv(str(VENV_PY), [str(VENV_PY), __file__, *sys.argv[1:]])
+
+from faster_whisper import WhisperModel  # noqa: E402
+
+
+def bell():
+    sys.stdout.write("\a")
+    sys.stdout.flush()
+
+
+def transcribe(model, wav_path):
+    segments, _info = model.transcribe(
+        str(wav_path), language="en", vad_filter=True, initial_prompt=INITIAL_PROMPT
+    )
+    return " ".join(s.text.strip() for s in segments).strip()
+
+
+def copy_to_clipboard(text):
+    result = subprocess.run([CLIP_EXE], input=text, text=True, capture_output=True)
+    if result.returncode != 0:
+        print(f"  [clipboard copy failed] {result.stderr.strip()}", file=sys.stderr)
+        return False
+    return True
+
+
+# --- Transcript display ------------------------------------------------------
+# The bottom row of the terminal is a status bar (hints, "Recording...",
+# typed /commands); everything above it is the transcript. Older transcripts
+# are dimmed, the newest one bold green. `/clear` empties the history.
+
+LATEST = "\033[1;92m"
+DIM = "\033[2m"
+RESET = "\033[0m"
+BAR = "\033[7m"             # reverse video
+BAR_RECORDING = "\033[1;97;41m"  # bold white on red
+
+history = []
+status = ("", BAR)
+
+
+def screen_rows():
+    return shutil.get_terminal_size().lines
+
+
+def set_status(msg, style=BAR):
+    global status
+    status = (msg, style)
+    rows = screen_rows()
+    width = shutil.get_terminal_size().columns
+    sys.stdout.write(f"\033[{rows};1H\033[2K{style}{msg[:width].ljust(width)}{RESET}")
+    sys.stdout.flush()
+
+
+def redraw():
+    rows = screen_rows()
+    # Keep transcript scrolling inside rows 1..rows-1 so it never covers the bar.
+    sys.stdout.write(f"\033[r\033[2J\033[3J\033[1;{rows - 1}r\033[H")
+    for i, text in enumerate(history):
+        style = LATEST if i == len(history) - 1 else DIM
+        sys.stdout.write(f"{style}> {text}{RESET}\n")
+    set_status(*status)
+
+
+def clear_history():
+    history.clear()
+    redraw()
+
+
+def restore_terminal():
+    sys.stdout.write(f"\033[r\033[?25h\033[{screen_rows()};1H\n")
+    sys.stdout.flush()
+
+
+def handle_result(model, wav_path, hint=""):
+    set_status("Transcribing...")
+    text = transcribe(model, wav_path)
+    wav_path.unlink(missing_ok=True)
+    if not text:
+        set_status(f"(heard nothing)  |  {hint}" if hint else "(heard nothing)")
+        return
+    history.append(text)
+    copied = copy_to_clipboard(text)
+    msg = "Copied -- switch to Codex and Ctrl+V" if copied else "Clipboard copy failed"
+    status_msg = f"{msg}  |  {hint}" if hint else msg
+    global status
+    status = (status_msg, BAR)
+    redraw()
+    if copied:
+        bell()
+
+
+# --- Silence-triggered hands-free loop (--loop) ---------------------------
+
+def record_utterance_silence(wav_path, silence_threshold="2%", trailing_silence="1.8"):
+    cmd = [
+        "sox", "-d", "-r", "16000", "-c", "1", str(wav_path),
+        "silence",
+        "1", "0.1", silence_threshold,
+        "1", trailing_silence, silence_threshold,
+    ]
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def loop_mode(model):
+    hint = "Listening... speak, then pause ~2s to copy. Ctrl+C to stop."
+    set_status(hint)
+    redraw()
+    bell()
+    try:
+        while True:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                wav_path = Path(tmp.name)
+            record_utterance_silence(wav_path)
+            handle_result(model, wav_path, hint=hint)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        restore_terminal()
+        print("Stopped.")
+
+
+# --- Push-to-talk mode (default) -------------------------------------------
+
+def read_key(timeout):
+    r, _, _ = select.select([sys.stdin], [], [], timeout)
+    if r:
+        return sys.stdin.read(1)
+    return None
+
+
+def record_until_toggle():
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        wav_path = Path(tmp.name)
+    proc = subprocess.Popen(
+        ["sox", "-d", "-r", "16000", "-c", "1", str(wav_path)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    cancelled = False
+    while True:
+        ch = read_key(None)
+        if ch == " ":
+            break
+        if ch == "\x1b":
+            cancelled = True
+            break
+    proc.terminate()
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    if cancelled:
+        wav_path.unlink(missing_ok=True)
+        return None
+    return wav_path
+
+
+ARMED_HINT = "ARMED  SPACE record  |  Esc disarm  |  /clear + Enter clears screen"
+IDLE_PROMPT = "Type 'voice' + Enter to arm, /clear to clear, Ctrl+C to quit: "
+
+
+def push_to_talk_mode(model):
+    fd = sys.stdin.fileno()
+    old_attrs = termios.tcgetattr(fd)
+    redraw()
+    try:
+        while True:
+            # Idle prompt lives on the status bar; the cursor sits after it.
+            sys.stdout.write("\033[?25h")
+            set_status(IDLE_PROMPT)
+            sys.stdout.write(f"\033[{screen_rows()};{len(IDLE_PROMPT) + 1}H{BAR}")
+            sys.stdout.flush()
+            try:
+                line = input()
+            except EOFError:
+                break
+            finally:
+                sys.stdout.write(RESET)
+            cmd = line.strip().lower()
+            if cmd == "/clear":
+                clear_history()
+                continue
+            if cmd != "voice":
+                redraw()
+                continue
+
+            sys.stdout.write("\033[?25l")  # hide cursor while armed
+            set_status(ARMED_HINT)
+            redraw()
+            bell()
+            tty.setcbreak(fd)
+            try:
+                cmd_buf = None  # collecting a "/command" when not None
+                while True:
+                    ch = read_key(None)
+                    if cmd_buf is not None:
+                        if ch in ("\n", "\r"):
+                            if cmd_buf.lower() == "/clear":
+                                set_status(ARMED_HINT)
+                                clear_history()
+                            else:
+                                set_status(f"(unknown command {cmd_buf})  |  {ARMED_HINT}")
+                            cmd_buf = None
+                        elif ch == "\x1b":
+                            cmd_buf = None
+                            set_status(ARMED_HINT)
+                        elif ch in ("\x7f", "\b"):
+                            cmd_buf = cmd_buf[:-1] or None
+                            set_status(f"Command: {cmd_buf}_" if cmd_buf else ARMED_HINT)
+                        elif ch and ch.isprintable() and ch != " ":
+                            cmd_buf += ch
+                            set_status(f"Command: {cmd_buf}_   (Enter to run, Esc to cancel)")
+                        continue
+                    if ch == "/":
+                        cmd_buf = "/"
+                        set_status("Command: /_   (Enter to run, Esc to cancel)")
+                        continue
+                    if ch == "\x1b":
+                        set_status("Disarmed.")
+                        break
+                    if ch != " ":
+                        continue
+                    set_status("RECORDING...  SPACE to stop  |  Esc to cancel", BAR_RECORDING)
+                    bell()
+                    wav_path = record_until_toggle()
+                    if wav_path is None:
+                        set_status(f"(cancelled)  |  {ARMED_HINT}")
+                        continue
+                    handle_result(model, wav_path, hint=ARMED_HINT)
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+        restore_terminal()
+        print("Stopped.")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--loop", action="store_true", help="Hands-free: no keys, silence-triggered")
+    ap.add_argument("--model", default="small.en", help="Whisper model size (default: small.en)")
+    args = ap.parse_args()
+
+    print(f"Loading speech model ({args.model})...")
+    model = WhisperModel(args.model, device="cpu", compute_type="int8", download_root=str(MODELS_DIR))
+
+    if args.loop:
+        loop_mode(model)
+    else:
+        push_to_talk_mode(model)
+
+
+if __name__ == "__main__":
+    main()

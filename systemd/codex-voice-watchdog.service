@@ -1,0 +1,7 @@
+[Unit]
+Description=Check and relaunch the codex-voice window if it isn't running
+
+[Service]
+Type=oneshot
+EnvironmentFile=-%h/.config/codex-voice/watchdog.env
+ExecStart=%h/.local/bin/codex-voice-watchdog

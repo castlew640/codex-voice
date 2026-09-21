@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Relaunches the codex-voice window if it isn't currently running.
+# `wt.exe` hands off to a detached window and exits immediately, so systemd
+# can't supervise the window's lifetime directly -- this script is polled
+# on a timer instead (see codex-voice-watchdog.timer).
+#
+# systemd services don't get WSL's Windows PATH or $WSL_DISTRO_NAME, so
+# install.sh records both in ~/.config/codex-voice/watchdog.env.
+set -euo pipefail
+
+WT_EXE="${CODEX_VOICE_WT_EXE:-wt.exe}"
+DISTRO="${CODEX_VOICE_DISTRO:-${WSL_DISTRO_NAME:-}}"
+
+if [[ -z "$DISTRO" ]]; then
+    echo "codex-voice-watchdog: WSL distro name unknown; re-run install.sh" >&2
+    exit 1
+fi
+
+if ! pgrep -f "$HOME/.local/bin/codex-voice" >/dev/null; then
+    "$WT_EXE" wsl.exe -d "$DISTRO" -- bash -lc codex-voice
+fi
