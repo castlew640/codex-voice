@@ -59,11 +59,16 @@ def transcribe(model, wav_path):
 
 
 def copy_to_clipboard(text):
-    result = subprocess.run([CLIP_EXE], input=text, text=True, capture_output=True)
+    """Returns None on success, else a short reason to show on the status bar."""
+    try:
+        result = subprocess.run([CLIP_EXE], input=text, text=True, capture_output=True)
+    except OSError as exc:
+        # Usually WSL interop is off -- binfmt_misc lost its WSLInterop entry
+        # (systemd-binfmt flushes it on boot), so no Windows .exe will run.
+        return f"can't run clip.exe: {exc.strerror}. WSL interop may be off"
     if result.returncode != 0:
-        print(f"  [clipboard copy failed] {result.stderr.strip()}", file=sys.stderr)
-        return False
-    return True
+        return result.stderr.strip() or f"clip.exe exited {result.returncode}"
+    return None
 
 
 # --- Transcript display ------------------------------------------------------
@@ -122,13 +127,13 @@ def handle_result(model, wav_path, hint=""):
         set_status(f"(heard nothing)  |  {hint}" if hint else "(heard nothing)")
         return
     history.append(text)
-    copied = copy_to_clipboard(text)
-    msg = "Copied -- switch to Codex and Ctrl+V" if copied else "Clipboard copy failed"
+    err = copy_to_clipboard(text)
+    msg = "Copied -- switch to Codex and Ctrl+V" if err is None else f"Clipboard failed: {err}"
     status_msg = f"{msg}  |  {hint}" if hint else msg
     global status
     status = (status_msg, BAR)
     redraw()
-    if copied:
+    if err is None:
         bell()
 
 
